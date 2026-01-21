@@ -1,13 +1,22 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
 import os
-import hashlib
+import base64
 
-app = FastAPI(
-    title="Yard2Garden AI Planner Backend",
-    version="1.0.0",
-    description="Backend API for Yard2Garden AI Planner (Cloud Run)."
+app = FastAPI(title="Yard2Garden AI Planner")
+
+# CORS (safe for mobile apps)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+# OpenAI client (API key comes from env var)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 @app.get("/")
 def root():
@@ -18,37 +27,63 @@ def health():
     return {"ok": True}
 
 @app.post("/analyze-yard")
-async def analyze_yard(
-    image: UploadFile = File(...),
-    zip_code: str | None = Form(default=None),
-    notes: str | None = Form(default=None),
-):
-    # Read bytes (limit size later if you want)
-    data = await image.read()
+async def analyze_yard(file: UploadFile = File(...)):
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
 
-    # Simple fingerprint so you can confirm uploads are arriving
-    sha = hashlib.sha256(data).hexdigest()[:12]
+    image_bytes = await file.read()
+    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    # TODO (next step): call OpenAI Vision + planning prompt using zip_code
-    # For now, return a clean stub response Unity can consume immediately.
-    result = {
-        "request": {
-            "filename": image.filename,
-            "content_type": image.content_type,
-            "bytes": len(data),
-            "sha12": sha,
-            "zip_code": zip_code,
-            "notes": notes,
-        },
-        "plan": {
-            "summary": "Stub plan — next step will generate a full garden layout + step-by-step instructions.",
-            "zones": [],
-            "steps": [
-                "Upload received successfully.",
-                "Next: AI will analyze the yard image and propose a layout.",
-                "Next: Generate step-by-step instructions tailored to your zip code.",
-            ],
-        },
+    prompt = """
+You are a master permaculture designer and food forest planner.
+
+Analyze the uploaded yard photo and return a practical, beginner-friendly
+food garden plan in STRICT JSON with this structure:
+
+{
+  "summary": "...",
+  "sun_exposure": "...",
+  "recommended_zones": [
+    {
+      "zone_name": "...",
+      "plants": ["..."],
+      "notes": "..."
     }
+  ],
+  "step_by_step_plan": [
+    "Step 1 ...",
+    "Step 2 ..."
+  ],
+  "shopping_list": [
+    {"item": "...", "quantity": "..."}
+  ]
+}
 
-    return JSONResponse(result)
+Be realistic, affordable, and focused on food production.
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{image_base64}"
+                        },
+                    },
+                ],
+            }
+        ],
+        temperature=0.4,
+    )
+
+    ai_output = response.choices[0].message.content
+
+    return {
+        "filename": file.filename,
+        "analysis": ai_output
+    }
