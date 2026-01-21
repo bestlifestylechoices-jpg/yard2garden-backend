@@ -1,23 +1,23 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 import base64
 import os
+import json
 
 app = FastAPI(title="Yard2Garden AI Planner")
 
-# CORS (good for Unity + browser testing)
+# CORS (safe for testing; later restrict origins to your Unity app domain/app scheme)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,  # must be False if allow_origins=["*"]
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# OpenAI client (reads OPENAI_API_KEY from env automatically)
-# You can also do: OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-client = OpenAI()
+# OpenAI client (expects OPENAI_API_KEY to be set in Cloud Run env vars / secret)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 @app.get("/")
 def root():
@@ -28,79 +28,90 @@ def health():
     return {"ok": True}
 
 @app.post("/analyze-yard")
-async def analyze_yard(
-    file: UploadFile = File(...),
-    zip_code: str | None = Form(None),
-    budget: str | None = Form(None),
-    upkeep: str | None = Form(None),
-):
+async def analyze_yard(file: UploadFile = File(...)):
     try:
-        # Basic validation
-        if not file:
-            raise HTTPException(status_code=400, detail="No file uploaded.")
-
-        # Optional: restrict to images
-        if file.content_type and not file.content_type.startswith("image/"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported file type: {file.content_type}. Please upload an image.",
-            )
-
+        # Read uploaded image
         image_bytes = await file.read()
         if not image_bytes:
-            raise HTTPException(status_code=400, detail="Uploaded file was empty.")
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-        # Encode image as a data URL (widely supported pattern)
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        content_type = file.content_type or "image/png"
-        image_data_url = f"data:{content_type};base64,{image_b64}"
 
-        # Build prompt with optional user constraints
-        constraints = []
-        if zip_code:
-            constraints.append(f"ZIP code: {zip_code}")
-        if budget:
-            constraints.append(f"Budget: {budget}")
-        if upkeep:
-            constraints.append(f"Upkeep level: {upkeep}")
-
-        constraints_text = ""
-        if constraints:
-            constraints_text = "\n\nUser constraints:\n- " + "\n- ".join(constraints)
-
-        prompt = (
-            "Analyze this yard photo and generate a beginner-friendly food garden plan.\n"
-            "Return:\n"
-            "1) A short summary of the yard (sun/shade, space, constraints)\n"
-            "2) Recommended garden zones (e.g., veg beds, herbs, fruit)\n"
-            "3) A step-by-step plan (numbered)\n"
-            "4) A simple shopping list with quantities\n"
-            "Keep it practical and realistic."
-            f"{constraints_text}"
+        # Prompt forcing strict JSON output
+        system_prompt = (
+            "You are a garden planning AI. "
+            "You MUST return ONLY valid JSON. "
+            "No markdown. No code fences. No commentary. No extra text."
         )
 
+        user_prompt = """
+Analyze the yard photo and return ONLY valid JSON using this exact schema:
+
+{
+  "summary": string,
+  "sun_exposure": string,
+  "recommended_zones": [
+    {
+      "zone_name": string,
+      "plants": [string, ...],
+      "notes": string
+    }
+  ],
+  "step_by_step_plan": [string, ...],
+  "shopping_list": [
+    { "item": string, "quantity": string }
+  ]
+}
+
+Rules:
+- Output MUST be valid JSON.
+- Do not wrap in ``` fences.
+- Do not include any text before or after the JSON.
+"""
+
+        # OpenAI Responses API call (vision)
         response = client.responses.create(
             model="gpt-5.2",
-            input=[{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": image_data_url},
-                ],
-            }],
+            input=[
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": system_prompt}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": user_prompt},
+                        {"type": "input_image", "image_base64": image_b64},
+                    ],
+                },
+            ],
         )
 
-        # Return clean JSON
+        raw_text = response.output_text or ""
+
+        # Attempt to parse JSON strictly
+        try:
+            plan = json.loads(raw_text)
+        except json.JSONDecodeError:
+            # Try a small cleanup in case of accidental leading/trailing whitespace
+            cleaned = raw_text.strip()
+            try:
+                plan = json.loads(cleaned)
+            except json.JSONDecodeError:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": "Model returned non-JSON output.",
+                        "raw_output_preview": cleaned[:500],
+                    },
+                )
+
         return {
             "filename": file.filename,
-            "zip_code": zip_code,
-            "budget": budget,
-            "upkeep": upkeep,
-            "garden_plan": response.output_text,
+            "plan": plan
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        # Helpful debugging message in Cloud Run logs + client response
-        raise HTTPException(status_code=500, detail=f"Analyze failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
