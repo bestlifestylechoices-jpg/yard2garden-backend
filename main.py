@@ -5,10 +5,7 @@ import os
 import base64
 
 app = FastAPI(title="Yard2Garden AI Planner")
-@app.get("/health")
-def health():
-    return {"ok": True}
-# CORS (safe for mobile apps)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,7 +14,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# OpenAI client (API key comes from env var)
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 @app.get("/")
@@ -30,62 +26,25 @@ def health():
 
 @app.post("/analyze-yard")
 async def analyze_yard(file: UploadFile = File(...)):
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
+    try:
+        image_bytes = await file.read()
+        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    image_bytes = await file.read()
-    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
-
-    prompt = """
-You are a master permaculture designer and food forest planner.
-
-Analyze the uploaded yard photo and return a practical, beginner-friendly
-food garden plan in STRICT JSON with this structure:
-
-{
-  "summary": "...",
-  "sun_exposure": "...",
-  "recommended_zones": [
-    {
-      "zone_name": "...",
-      "plants": ["..."],
-      "notes": "..."
-    }
-  ],
-  "step_by_step_plan": [
-    "Step 1 ...",
-    "Step 2 ..."
-  ],
-  "shopping_list": [
-    {"item": "...", "quantity": "..."}
-  ]
-}
-
-Be realistic, affordable, and focused on food production.
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
+        response = client.responses.create(
+            model="gpt-5.2",
+            input=[{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{image_base64}"
-                        },
-                    },
-                ],
-            }
-        ],
-        temperature=0.4,
-    )
+                    {"type": "input_text", "text": "Analyze this yard and create a complete food garden plan with sun zones, planting layout, and step-by-step instructions."},
+                    {"type": "input_image", "image_base64": image_base64}
+                ]
+            }]
+        )
 
-    ai_output = response.choices[0].message.content
+        return {
+            "filename": file.filename,
+            "garden_plan": response.output_text
+        }
 
-    return {
-        "filename": file.filename,
-        "analysis": ai_output
-    }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
