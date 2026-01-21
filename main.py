@@ -6,6 +6,10 @@ import base64
 
 app = FastAPI(title="Yard2Garden AI Planner")
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 # CORS (safe for mobile apps)
 app.add_middleware(
     CORSMiddleware,
