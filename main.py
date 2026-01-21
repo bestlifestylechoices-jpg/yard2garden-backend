@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
+import base64
 import os
 import base64
 
@@ -14,7 +15,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI()
 
 @app.get("/")
 def root():
@@ -28,20 +29,22 @@ def health():
 async def analyze_yard(file: UploadFile = File(...)):
     try:
         image_bytes = await file.read()
-        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-        response = client.responses.create(
-            model="gpt-5.2",
-            input=[{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "Analyze this yard and create a complete food garden plan with sun zones, planting layout, and step-by-step instructions."},
-                    {"type": "input_image", "image_base64": image_base64}
-                ]
-            }]
-        )
+response = client.responses.create(
+    model="gpt-5.2",
+    input=[{
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "Analyze this yard and generate a planting plan."},
+            {"type": "input_image", "image_base64": image_b64}
+        ]
+    }]
+)
 
-        return {
+result = response.output_text
+return {"result": result}
+ {
             "filename": file.filename,
             "garden_plan": response.output_text
         }
