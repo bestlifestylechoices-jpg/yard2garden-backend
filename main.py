@@ -219,7 +219,7 @@ Constraints:
 
 Return STRICT JSON only, matching this schema:
 {json.dumps(plan_instructions["output_format"], indent=2)}
-"""زر},
+"""},
                         {"type": "input_image", "image_url": f"data:image/jpeg;base64,{img_b64}"}
                     ]
                 }
