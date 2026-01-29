@@ -1,3 +1,8 @@
+Main.py 
+
+
+
+
 import base64
 import json
 import os
@@ -214,12 +219,21 @@ Constraints:
 - budget_level: {budget_level}
 - upkeep_level: {upkeep_level}
 - location (approx): lat={lat}, lon={lon}
-- goal: photorealistic transformation + step-by-step plan for a family food garden
-- keep it realistic, achievable, and climate-aware
 
-Return STRICT JSON only, matching this schema:
-{json.dumps(plan_instructions["output_format"], indent=2)}
-"""},
+Requirements:
+- Plan must be realistic, achievable, and climate-aware.
+- Assume the user wants a family food garden (vegetables + herbs, optional berries).
+- DO NOT recommend anything illegal or unsafe.
+- Output MUST be STRICT JSON only.
+
+Most important:
+- The image_prompt MUST describe the SAME YARD with the SAME camera angle/perspective.
+- Preserve existing house/fence/trees and hardscape; only add garden elements.
+- Photorealistic, natural lighting, no text overlays, no watermarks, no people.
+
+Return STRICT JSON only, matching this schema exactly:
+{...schema...}
+,
                         {"type": "input_image", "image_url": f"data:image/jpeg;base64,{img_b64}"}
                     ]
                 }
