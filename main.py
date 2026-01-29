@@ -1,3 +1,8 @@
+Main.py 
+
+
+
+
 import base64
 import json
 import os
@@ -151,10 +156,19 @@ async def yard2garden(
     # 1) Vision + plan (structured JSON)
     # -----------------------------
     plan_system = (
-        "You are Yard2Garden AI Planner. "
-        "Given a yard photo and constraints, produce a practical, step-by-step edible garden plan. "
-        "Assume typical seasonal planting for the user’s region based on approximate lat/lon if provided. "
-        "If location is missing, be conservative and provide a flexible plan."
+        "You are Yard2Garden AI Planner.
+
+Your job:
+1) Look at the provided yard photo.
+2) Produce a practical edible-garden plan the user can actually build.
+3) Provide an “AFTER photo prompt” that transforms THIS SAME YARD into a food garden.
+
+Hard rules:
+- Output MUST be valid JSON only (no markdown, no code fences, no extra text).
+- Be realistic for the climate implied by lat/lon if present; if missing, give a flexible “most-temperate” plan with clear assumptions.
+- Keep budget_level and upkeep_level constraints.
+- Prefer simple, high-success crops and beginner-friendly steps.
+- Make the plan feel empowering: clear, step-by-step, no vague advice."
     )
 
     plan_instructions = {
