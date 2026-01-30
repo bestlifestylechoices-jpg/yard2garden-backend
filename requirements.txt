@@ -1,6 +1,7 @@
-fastapi==0.112.0
-uvicorn[standard]==0.30.5
-python-multipart==0.0.9
-pydantic==2.8.2
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+python-multipart==0.0.20
 google-cloud-secret-manager==2.20.2
-openai==1.40.0
+openai==1.59.6
+requests==2.32.3
