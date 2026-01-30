@@ -10,10 +10,25 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 
+
+# ----------------------------
+# Config
+# ----------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+# You can override these in Cloud Run env vars without changing code
+PLAN_MODEL = os.getenv("PLAN_MODEL", "gpt-4o-mini")
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1")
+
+# Hard safety limits
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(8 * 1024 * 1024)))  # 8MB default
+OUTPUT_IMAGE_SIZE = os.getenv("OUTPUT_IMAGE_SIZE", "1024x1024")            # e.g., 1024x1024
+
+
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Yard2Garden AI Planner", version="0.4.0")
+app = FastAPI(title="Yard2Garden AI Planner Backend", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,10 +38,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------
-# OpenAI Client
-# ----------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
@@ -61,21 +72,14 @@ def _extract_json(text: str) -> Dict[str, Any]:
     return json.loads(s[lb : rb + 1])
 
 
-def _validate_zip(zip_code: Optional[str]) -> Optional[str]:
-    if not zip_code:
-        return None
-    z = zip_code.strip()
-    return z if z else None
-
-
 def _location_ok(lat: Optional[float], lon: Optional[float]) -> bool:
     if lat is None or lon is None:
         return False
-    return -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
+    return (-90.0 <= lat <= 90.0) and (-180.0 <= lon <= 180.0)
 
 
 def _budget_to_usd(budget: Literal["low", "medium", "high"]) -> Dict[str, int]:
-    # These are "feel" numbers for the plan; your UI can interpret them however you want.
+    # Simple tiers; tune anytime
     if budget == "low":
         return {"target_usd": 150, "max_usd": 350}
     if budget == "medium":
@@ -83,7 +87,7 @@ def _budget_to_usd(budget: Literal["low", "medium", "high"]) -> Dict[str, int]:
     return {"target_usd": 1500, "max_usd": 3500}
 
 
-async def _process_request(
+async def _handle_yard2garden(
     upload: UploadFile,
     budget: Literal["low", "medium", "high"],
     upkeep: Literal["low", "medium", "high"],
@@ -93,11 +97,11 @@ async def _process_request(
     zip_code: Optional[str],
 ) -> Dict[str, Any]:
     """
-    Shared handler for /v1/yard2garden and /analyze-yard.
-    Returns top-level:
-      - image_b64_png: base64 PNG (no data URI prefix)
-      - plan: JSON string (for Unity display)
-      - plan_json: object (nice for web clients)
+    Generates:
+    - photorealistic updated yard image (base64 PNG)
+    - step-by-step plan (JSON object + pretty string)
+
+    Returns BOTH modern + backward-compat fields so Unity can always display something.
     """
     if client is None:
         raise HTTPException(
@@ -108,23 +112,22 @@ async def _process_request(
     image_bytes = await upload.read()
     if not image_bytes:
         raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail=f"Image too large. Max is {MAX_IMAGE_BYTES} bytes.")
 
-    if len(image_bytes) > 8 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Image too large. Please upload an image under 8MB.")
-
-    zip_norm = _validate_zip(zip_code)
     has_location = _location_ok(latitude, longitude)
     budget_info = _budget_to_usd(budget)
+    zip_norm = (zip_code.strip() if zip_code and zip_code.strip() else None)
 
-    # Base64 for vision call
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    # Base64 for vision plan request
+    image_b64_in = base64.b64encode(image_bytes).decode("utf-8")
 
     # ----------------------------
-    # 1) Structured plan
+    # 1) Generate plan JSON
     # ----------------------------
     climate_hint = ""
     if has_location:
-        climate_hint = f"Approx location: lat {latitude}, lon {longitude}."
+        climate_hint = f"Approx location: lat {latitude:.6f}, lon {longitude:.6f}."
     elif zip_norm:
         climate_hint = f"ZIP/postal: {zip_norm}."
     else:
@@ -182,77 +185,87 @@ Output MUST be valid JSON (no markdown, no commentary) matching this schema:
 
     try:
         plan_resp = client.responses.create(
-            model="gpt-5.2",
+            model=PLAN_MODEL,
             input=[
                 {
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": plan_prompt},
-                        {"type": "input_image", "image_base64": image_b64},
+                        {"type": "input_image", "image_base64": image_b64_in},
                     ],
                 }
             ],
         )
         plan_raw = plan_resp.output_text or ""
-        plan_json = _extract_json(plan_raw)
+        garden_plan = _extract_json(plan_raw)
 
-        # Force assumptions to reflect actual inputs
-        plan_json.setdefault("assumptions", {})
-        plan_json["assumptions"]["location"] = (
+        # Ensure assumptions reflect actual inputs
+        garden_plan.setdefault("assumptions", {})
+        garden_plan["assumptions"]["location"] = (
             {"latitude": latitude, "longitude": longitude, "accuracy_m": accuracy_m} if has_location else None
         )
-        plan_json["assumptions"]["zip_code"] = zip_norm
-        plan_json["assumptions"]["budget_tier"] = budget
-        plan_json["assumptions"]["budget_target_usd"] = budget_info["target_usd"]
-        plan_json["assumptions"]["budget_max_usd"] = budget_info["max_usd"]
-        plan_json["assumptions"]["upkeep_level"] = upkeep
+        garden_plan["assumptions"]["zip_code"] = zip_norm
+        garden_plan["assumptions"]["budget_tier"] = budget
+        garden_plan["assumptions"]["budget_target_usd"] = budget_info["target_usd"]
+        garden_plan["assumptions"]["budget_max_usd"] = budget_info["max_usd"]
+        garden_plan["assumptions"]["upkeep_level"] = upkeep
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Plan generation failed: {str(e)}")
 
+    plan_text = json.dumps(garden_plan, ensure_ascii=False, indent=2)
+
     # ----------------------------
-    # 2) Photorealistic transformed image
+    # 2) Generate photorealistic updated image (PNG base64)
     # ----------------------------
+    after_prompt = f"""
+Transform this exact yard photo into a realistic food-producing garden that could actually be built.
+Maintain the same camera angle, perspective, and property boundaries.
+
+Constraints:
+- Budget tier: {budget} (aim around ${budget_info["target_usd"]}; avoid luxury hardscape features)
+- Upkeep level: {upkeep}
+- {climate_hint}
+
+Design notes:
+- Add sensible beds, mulch, simple paths, and realistic spacing.
+- Region-appropriate plants (avoid tropical unless climate supports it).
+- Photorealistic, natural lighting.
+- No text overlays, no labels, no watermarks.
+""".strip()
+
     try:
         with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
             tmp.write(image_bytes)
             tmp.flush()
 
-            after_prompt = f"""
-Transform this exact yard photo into a realistic food-producing garden that could actually be built.
-Maintain the same camera angle, perspective, and property boundaries.
-
-Constraints:
-- Budget tier: {budget} (aim around ${budget_info["target_usd"]}, never imply luxury hardscapes)
-- Upkeep level: {upkeep}
-- {climate_hint}
-
-Design notes:
-- Add beds, simple paths, mulch, and sensible spacing.
-- Use region-appropriate plants (avoid tropical unless climate supports it).
-- Photorealistic, natural lighting, no text overlays, no labels, no watermarks.
-""".strip()
-
+            # OpenAI image edit
             img = client.images.edit(
-                model="gpt-image-1.5",
+                model=IMAGE_MODEL,
                 image=[open(tmp.name, "rb")],
                 prompt=after_prompt,
-                size="1024x1024",
+                size=OUTPUT_IMAGE_SIZE,
                 output_format="png",
             )
 
-            after_b64 = img.data[0].b64_json
-            _ = base64.b64decode(after_b64)  # validate decodes
+            # Most OpenAI image responses include base64 in b64_json
+            image_b64_png = img.data[0].b64_json
+
+            # Validate base64
+            _ = base64.b64decode(image_b64_png)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Image transformation failed: {str(e)}")
 
-    plan_text = json.dumps(plan_json, ensure_ascii=False, indent=2)
-
+    # Return modern + backward-compat keys
     return {
-        "image_b64_png": after_b64,
+        # Modern / Unity-friendly
+        "image_b64_png": image_b64_png,
         "plan": plan_text,
-        "plan_json": plan_json,  # optional but useful
+
+        # Backward compatibility (older Unity parsing)
+        "after_image": {"mime": "image/png", "base64": image_b64_png},
+        "garden_plan": garden_plan,
     }
 
 
@@ -261,7 +274,12 @@ Design notes:
 # ----------------------------
 @app.get("/")
 def root():
-    return {"ok": True, "service": "yard2garden-backend"}
+    return {"ok": True, "service": "yard2garden-backend", "version": "1.0.0"}
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 
 @app.post("/v1/yard2garden")
@@ -269,7 +287,7 @@ async def yard2garden(
     file: UploadFile = File(None),
     image: UploadFile = File(None),
 
-    # Location (accept both naming styles from Unity)
+    # Accept both naming styles for location
     has_location: Optional[bool] = Form(None),
     lat: Optional[float] = Form(None),
     lon: Optional[float] = Form(None),
@@ -291,12 +309,12 @@ async def yard2garden(
     lat_use = latitude if latitude is not None else lat
     lon_use = longitude if longitude is not None else lon
 
-    # If client sends has_location=false, ignore any lat/lon
+    # If the client explicitly says has_location=false, ignore any lat/lon
     if has_location is False:
         lat_use = None
         lon_use = None
 
-    return await _process_request(
+    return await _handle_yard2garden(
         upload=upload,
         budget=budget,
         upkeep=upkeep,
@@ -307,15 +325,17 @@ async def yard2garden(
     )
 
 
-# Backward-compatible alias (older Unity configs might hit this)
+# Keep your old route for backward compatibility
 @app.post("/analyze-yard")
 async def analyze_yard(
     file: UploadFile = File(None),
     image: UploadFile = File(None),
+
     latitude: Optional[float] = Form(None),
     longitude: Optional[float] = Form(None),
     accuracy_m: Optional[float] = Form(None),
     zip_code: Optional[str] = Form(None),
+
     budget: Literal["low", "medium", "high"] = Form(...),
     upkeep: Literal["low", "medium", "high"] = Form(...),
 ):
@@ -323,7 +343,7 @@ async def analyze_yard(
     if upload is None:
         raise HTTPException(status_code=422, detail="Missing file upload. Use multipart field 'file' (or 'image').")
 
-    return await _process_request(
+    return await _handle_yard2garden(
         upload=upload,
         budget=budget,
         upkeep=upkeep,
