@@ -1,369 +1,365 @@
-from __future__ import annotations
-
-import os
-import json
 import base64
-import tempfile
-from typing import Any, Dict, Optional, Literal
+import json
+import os
+import re
+import time
+import uuid
+from typing import Optional, List
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+import requests
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from google.cloud import secretmanager
 from openai import OpenAI
-
 
 # ----------------------------
 # Config
 # ----------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# You can override these in Cloud Run env vars without changing code
-PLAN_MODEL = os.getenv("PLAN_MODEL", "gpt-4o-mini")
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1")
+OPENAI_API_BASE = "https://api.openai.com/v1"
+DEFAULT_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5.2")
+DEFAULT_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1.5")  # per OpenAI image docs :contentReference[oaicite:2]{index=2}
 
-# Hard safety limits
-MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(8 * 1024 * 1024)))  # 8MB default
-OUTPUT_IMAGE_SIZE = os.getenv("OUTPUT_IMAGE_SIZE", "1024x1024")            # e.g., 1024x1024
+# CORS: for Unity builds; tighten later if you want
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
+
+# Secret Manager name containing OpenAI API key
+OPENAI_API_KEY_SECRET_NAME = os.getenv("OPENAI_API_KEY_SECRET_NAME", "openai_api_key")
+
+# Cache secrets in-memory
+_cached_openai_key: Optional[str] = None
+
+# ----------------------------
+# FastAPI
+# ----------------------------
+
+app = FastAPI(title="Yard2Garden Backend", version="1.0.0")
 
 
 # ----------------------------
-# App
+# Models
 # ----------------------------
-app = FastAPI(title="Yard2Garden AI Planner Backend", version="1.0.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten later if you want
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+class Yard2GardenRequest(BaseModel):
+    image_b64: str = Field(..., description="Base64-encoded image bytes (NO data URL prefix).")
+    image_mime: str = Field("image/jpeg", description="image/jpeg or image/png recommended.")
+    latitude: Optional[float] = Field(None, description="Approximate latitude (optional).")
+    longitude: Optional[float] = Field(None, description="Approximate longitude (optional).")
+    budget_usd: Optional[float] = Field(None, description="Optional budget guidance.")
+    upkeep_level: Optional[str] = Field(None, description="low | medium | high (optional).")
 
-client: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+class Yard2GardenResponse(BaseModel):
+    image_b64_png: str
+    plan_markdown: str
+    request_id: str
 
 
 # ----------------------------
-# Helpers
+# Utilities
 # ----------------------------
-def _extract_json(text: str) -> Dict[str, Any]:
+
+def _get_openai_api_key() -> str:
     """
-    Accepts either raw JSON or fenced ```json ... ``` and returns parsed dict.
+    Resolve OpenAI API key securely.
+    Order:
+      1) OPENAI_API_KEY env var (local dev)
+      2) Google Secret Manager (Cloud Run)
     """
-    if not text or not text.strip():
-        raise ValueError("Empty model output")
+    global _cached_openai_key
 
-    s = text.strip()
+    if _cached_openai_key:
+        return _cached_openai_key
 
-    # Strip fenced blocks if present
-    if "```" in s:
-        start = s.find("```")
-        end = s.rfind("```")
-        if start != -1 and end != -1 and end > start:
-            inner = s[start + 3 : end].strip()
-            if inner.lower().startswith("json"):
-                inner = inner[4:].strip()
-            s = inner
+    env_key = os.getenv("OPENAI_API_KEY")
+    if env_key and env_key.strip():
+        _cached_openai_key = env_key.strip()
+        return _cached_openai_key
 
-    # Trim anything before first { and after last }
-    lb = s.find("{")
-    rb = s.rfind("}")
-    if lb == -1 or rb == -1 or rb <= lb:
-        raise ValueError("No JSON object found in model output")
+    # Secret Manager
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT")
+    if not project_id:
+        raise RuntimeError("Missing GOOGLE_CLOUD_PROJECT (or GCP_PROJECT). Cloud Run normally sets this.")
 
-    return json.loads(s[lb : rb + 1])
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{project_id}/secrets/{OPENAI_API_KEY_SECRET_NAME}/versions/latest"
+    resp = client.access_secret_version(request={"name": name})
+    key = resp.payload.data.decode("utf-8").strip()
 
+    if not key:
+        raise RuntimeError("OpenAI API key retrieved from Secret Manager is empty.")
 
-def _location_ok(lat: Optional[float], lon: Optional[float]) -> bool:
-    if lat is None or lon is None:
-        return False
-    return (-90.0 <= lat <= 90.0) and (-180.0 <= lon <= 180.0)
+    _cached_openai_key = key
+    return _cached_openai_key
 
 
-def _budget_to_usd(budget: Literal["low", "medium", "high"]) -> Dict[str, int]:
-    # Simple tiers; tune anytime
-    if budget == "low":
-        return {"target_usd": 150, "max_usd": 350}
-    if budget == "medium":
-        return {"target_usd": 500, "max_usd": 1200}
-    return {"target_usd": 1500, "max_usd": 3500}
-
-
-async def _handle_yard2garden(
-    upload: UploadFile,
-    budget: Literal["low", "medium", "high"],
-    upkeep: Literal["low", "medium", "high"],
-    latitude: Optional[float],
-    longitude: Optional[float],
-    accuracy_m: Optional[float],
-    zip_code: Optional[str],
-) -> Dict[str, Any]:
+def _ensure_base64_clean(b64_str: str) -> str:
     """
-    Generates:
-    - photorealistic updated yard image (base64 PNG)
-    - step-by-step plan (JSON object + pretty string)
-
-    Returns BOTH modern + backward-compat fields so Unity can always display something.
+    Accepts raw base64 or a data URL; returns raw base64.
     """
-    if client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="OPENAI_API_KEY is not configured on the server (Cloud Run env var missing).",
-        )
+    b64_str = b64_str.strip()
+    if b64_str.startswith("data:"):
+        # data:image/jpeg;base64,XXXX
+        parts = b64_str.split(",", 1)
+        if len(parts) == 2:
+            return parts[1].strip()
+    return b64_str
 
-    image_bytes = await upload.read()
-    if not image_bytes:
-        raise HTTPException(status_code=422, detail="Uploaded file is empty.")
-    if len(image_bytes) > MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=413, detail=f"Image too large. Max is {MAX_IMAGE_BYTES} bytes.")
 
-    has_location = _location_ok(latitude, longitude)
-    budget_info = _budget_to_usd(budget)
-    zip_norm = (zip_code.strip() if zip_code and zip_code.strip() else None)
+def _build_data_url(image_mime: str, image_b64: str) -> str:
+    image_b64 = _ensure_base64_clean(image_b64)
+    return f"data:{image_mime};base64,{image_b64}"
 
-    # Base64 for vision plan request
-    image_b64_in = base64.b64encode(image_bytes).decode("utf-8")
 
-    # ----------------------------
-    # 1) Generate plan JSON
-    # ----------------------------
-    climate_hint = ""
-    if has_location:
-        climate_hint = f"Approx location: lat {latitude:.6f}, lon {longitude:.6f}."
-    elif zip_norm:
-        climate_hint = f"ZIP/postal: {zip_norm}."
-    else:
-        climate_hint = "Location unknown (use safe, general assumptions)."
+def _safe_upkeep(upkeep: Optional[str]) -> Optional[str]:
+    if upkeep is None:
+        return None
+    u = upkeep.strip().lower()
+    if u in ("low", "medium", "high"):
+        return u
+    return None
 
-    plan_prompt = f"""
-You are Yard2Garden AI Planner.
 
-Goal:
-Turn the user's yard photo into a realistic, buildable, food-producing garden plan.
-
-Inputs:
-- Budget tier: {budget} (aim around ${budget_info["target_usd"]}, do not exceed ${budget_info["max_usd"]})
-- Upkeep tier: {upkeep} (low=low maintenance; high=more intensive)
-- {climate_hint}
-
-Output MUST be valid JSON (no markdown, no commentary) matching this schema:
-
-{{
-  "summary": string,
-  "assumptions": {{
-    "location": object|null,
-    "zip_code": string|null,
-    "budget_tier": string,
-    "budget_target_usd": number,
-    "budget_max_usd": number,
-    "upkeep_level": string
-  }},
-  "zones": [
-    {{
-      "name": string,
-      "where_in_yard": string,
-      "sun_estimate": string,
-      "bed_type": string,
-      "plants": [string],
-      "why_these": string
-    }}
-  ],
-  "step_by_step": [
-    {{ "step": number, "title": string, "detail": string, "time_estimate_minutes": number }}
-  ],
-  "shopping_list": [
-    {{ "item": string, "qty": string, "estimated_cost_usd": number }}
-  ],
-  "estimated_total_cost_usd": number,
-  "maintenance_plan": {{
-    "weekly_minutes": number,
-    "watering_guidance": string,
-    "weeding_guidance": string,
-    "mulching_guidance": string,
-    "pest_management_guidance": string
-  }}
-}}
-""".strip()
-
+def _safe_budget(budget: Optional[float]) -> Optional[float]:
+    if budget is None:
+        return None
     try:
-        response = {
-    "plan": plan_text,
-    "garden_plan": garden_plan,
-}
+        b = float(budget)
+        if b < 0:
+            return None
+        return b
+    except Exception:
+        return None
 
-if image_b64_png:
-    response["image_b64_png"] = image_b64_png
-    response["after_image"] = {"mime": "image/png", "base64": image_b64_png}
 
-if image_url:
-    response["image_url"] = image_url
+def _extract_output_text(resp) -> str:
+    """
+    Works with OpenAI SDK objects or dicts.
+    """
+    # New SDK often provides resp.output_text
+    if hasattr(resp, "output_text") and isinstance(resp.output_text, str):
+        return resp.output_text.strip()
 
-return response
+    # Dict fallback
+    if isinstance(resp, dict):
+        if "output_text" in resp and isinstance(resp["output_text"], str):
+            return resp["output_text"].strip()
 
-        plan_resp = client.responses.create(
-            model=PLAN_MODEL,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": plan_prompt},
-                        {"type": "input_image", "image_base64": image_b64_in},
-                    ],
-                }
-            ],
-        )
-        plan_raw = plan_resp.output_text or ""
-        garden_plan = _extract_json(plan_raw)
+        # Parse "output" items for message content
+        out = resp.get("output", [])
+        texts: List[str] = []
+        for item in out:
+            if item.get("type") == "message":
+                for c in item.get("content", []):
+                    if c.get("type") in ("output_text", "text"):
+                        t = c.get("text", "")
+                        if t:
+                            texts.append(t)
+        return "\n".join(texts).strip()
 
-        # Ensure assumptions reflect actual inputs
-        garden_plan.setdefault("assumptions", {})
-        garden_plan["assumptions"]["location"] = (
-            {"latitude": latitude, "longitude": longitude, "accuracy_m": accuracy_m} if has_location else None
-        )
-        garden_plan["assumptions"]["zip_code"] = zip_norm
-        garden_plan["assumptions"]["budget_tier"] = budget
-        garden_plan["assumptions"]["budget_target_usd"] = budget_info["target_usd"]
-        garden_plan["assumptions"]["budget_max_usd"] = budget_info["max_usd"]
-        garden_plan["assumptions"]["upkeep_level"] = upkeep
+    return ""
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Plan generation failed: {str(e)}")
 
-    plan_text = json.dumps(garden_plan, ensure_ascii=False, indent=2)
-
-    # ----------------------------
-    # 2) Generate photorealistic updated image (PNG base64)
-    # ----------------------------
-    after_prompt = f"""
-Transform this exact yard photo into a realistic food-producing garden.
-Maintain the same camera angle and property boundaries.
-Photorealistic, natural lighting, no text, no labels, no watermark.
-
-Constraints:
-- Budget tier: {budget} (aim around ${budget_info["target_usd"]}; avoid luxury hardscape features)
-- Upkeep level: {upkeep}
-- {climate_hint}
-
-Design notes:
-- Add sensible beds, mulch, simple paths, and realistic spacing.
-- Region-appropriate plants (avoid tropical unless climate supports it).
-- Photorealistic, natural lighting.
-- No text overlays, no labels, no watermarks.
-""".strip()
-
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
-            tmp.write(image_bytes)
-            tmp.flush()
-
-            # OpenAI image edit
-            img = client.images.edit(
-    model=IMAGE_MODEL,
-    image=[open(tmp.name, "rb")],
-    prompt=after_prompt,
-    size=OUTPUT_IMAGE_SIZE,
-)
-
-image_b64_png = None
-image_url = None
-
-if hasattr(img.data[0], "b64_json") and img.data[0].b64_json:
-    image_b64_png = img.data[0].b64_json
-elif hasattr(img.data[0], "url") and img.data[0].url:
-    image_url = img.data[0].url
-else:
-    raise Exception("Image generated but no usable image field returned")
-
-    # Return modern + backward-compat keys
-    return {
-        # Modern / Unity-friendly
-        "image_b64_png": image_b64_png,
-        "plan": plan_text,
-
-        # Backward compatibility (older Unity parsing)
-        "after_image": {"mime": "image/png", "base64": image_b64_png},
-        "garden_plan": garden_plan,
-    }
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    # remove triple backtick fences if any
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", s)
+        s = re.sub(r"\n```$", "", s)
+    return s.strip()
 
 
 # ----------------------------
-# Routes
+# Middleware: Simple CORS
 # ----------------------------
-@app.get("/")
-def root():
-    return {"ok": True, "service": "yard2garden-backend", "version": "1.0.0"}
 
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+
+    origin = request.headers.get("origin")
+    allow_origin = "*"
+    if ALLOWED_ORIGINS and ALLOWED_ORIGINS != ["*"] and origin:
+        if origin in ALLOWED_ORIGINS:
+            allow_origin = origin
+        else:
+            allow_origin = ALLOWED_ORIGINS[0]  # fallback (tighten later)
+
+    response.headers["Access-Control-Allow-Origin"] = allow_origin
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    response.headers["Access-Control-Max-Age"] = "3600"
+    return response
+
+
+@app.options("/{path:path}")
+async def options_handler(path: str):
+    return JSONResponse(content={"ok": True})
+
+
+# ----------------------------
+# Health
+# ----------------------------
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-@app.post("/v1/yard2garden")
-async def yard2garden(
-    file: UploadFile = File(None),
-    image: UploadFile = File(None),
+# ----------------------------
+# Core Endpoint
+# ----------------------------
 
-    # Accept both naming styles for location
-    has_location: Optional[bool] = Form(None),
-    lat: Optional[float] = Form(None),
-    lon: Optional[float] = Form(None),
+@app.post("/v1/yard2garden", response_model=Yard2GardenResponse)
+def yard2garden(payload: Yard2GardenRequest):
+    request_id = str(uuid.uuid4())
 
-    latitude: Optional[float] = Form(None),
-    longitude: Optional[float] = Form(None),
-    accuracy_m: Optional[float] = Form(None),
+    # Validate / normalize
+    image_b64 = _ensure_base64_clean(payload.image_b64)
+    image_mime = (payload.image_mime or "image/jpeg").strip().lower()
+    if image_mime not in ("image/jpeg", "image/png", "image/webp"):
+        # We still accept it, but enforce a safe default for data URL
+        image_mime = "image/jpeg"
 
-    zip_code: Optional[str] = Form(None),
+    lat = payload.latitude
+    lng = payload.longitude
+    budget = _safe_budget(payload.budget_usd)
+    upkeep = _safe_upkeep(payload.upkeep_level)
 
-    budget: Literal["low", "medium", "high"] = Form(...),
-    upkeep: Literal["low", "medium", "high"] = Form(...),
-):
-    upload = file or image
-    if upload is None:
-        raise HTTPException(status_code=422, detail="Missing file upload. Use multipart field 'file' (or 'image').")
+    # Build prompt context
+    location_line = ""
+    if lat is not None and lng is not None:
+        location_line = f"Approximate location (lat,lng): {lat:.6f}, {lng:.6f}."
 
-    # Decide which lat/lon to use
-    lat_use = latitude if latitude is not None else lat
-    lon_use = longitude if longitude is not None else lon
+    budget_line = ""
+    if budget is not None:
+        budget_line = f"Budget constraint: ${budget:,.0f} USD (prioritize high-impact essentials)."
 
-    # If the client explicitly says has_location=false, ignore any lat/lon
-    if has_location is False:
-        lat_use = None
-        lon_use = None
+    upkeep_line = ""
+    if upkeep is not None:
+        upkeep_line = f"Upkeep preference: {upkeep} (design accordingly)."
 
-    return await _handle_yard2garden(
-        upload=upload,
-        budget=budget,
-        upkeep=upkeep,
-        latitude=lat_use,
-        longitude=lon_use,
-        accuracy_m=accuracy_m,
-        zip_code=zip_code,
-    )
+    # ----------------------------
+    # 1) Generate the step-by-step plan (vision-capable text model)
+    # ----------------------------
 
+    try:
+        api_key = _get_openai_api_key()
+        client = OpenAI(api_key=api_key)
 
-# Keep your old route for backward compatibility
-@app.post("/analyze-yard")
-async def analyze_yard(
-    file: UploadFile = File(None),
-    image: UploadFile = File(None),
+        input_image_data_url = _build_data_url(image_mime, image_b64)
 
-    latitude: Optional[float] = Form(None),
-    longitude: Optional[float] = Form(None),
-    accuracy_m: Optional[float] = Form(None),
-    zip_code: Optional[str] = Form(None),
+        plan_prompt = f"""
+You are a professional garden planner.
 
-    budget: Literal["low", "medium", "high"] = Form(...),
-    upkeep: Literal["low", "medium", "high"] = Form(...),
-):
-    upload = file or image
-    if upload is None:
-        raise HTTPException(status_code=422, detail="Missing file upload. Use multipart field 'file' (or 'image').")
+Task:
+1) Analyze the provided yard photo.
+2) Produce a professional, practical, step-by-step plan to transform this yard into a thriving edible garden.
+3) Use the user's approximate location ONLY to choose climate-appropriate crops and timing (do not mention saving data).
+4) Keep it realistic for typical home gardeners.
 
-    return await _handle_yard2garden(
-        upload=upload,
-        budget=budget,
-        upkeep=upkeep,
-        latitude=latitude,
-        longitude=longitude,
-        accuracy_m=accuracy_m,
-        zip_code=zip_code,
+Context:
+{location_line}
+{budget_line}
+{upkeep_line}
+
+Output format:
+Return Markdown with these sections:
+- ## Overview
+- ## Quick wins (first weekend)
+- ## Layout plan (zones)
+- ## Crop recommendations (what grows well here)
+- ## Soil + compost plan
+- ## Irrigation plan
+- ## Planting calendar (next 90 days)
+- ## Materials list (prioritized)
+- ## Maintenance checklist
+- ## Safety notes
+
+Be concise, clear, and actionable.
+""".strip()
+
+        # Responses API supports image input as base64 data URLs :contentReference[oaicite:3]{index=3}
+        resp = client.responses.create(
+            model=DEFAULT_TEXT_MODEL,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": plan_prompt},
+                        {"type": "input_image", "image_url": input_image_data_url},
+                    ],
+                }
+            ],
+            # Keep it deterministic-ish
+            temperature=0.6,
+        )
+
+        plan_markdown = _strip_code_fences(_extract_output_text(resp))
+        if not plan_markdown:
+            raise RuntimeError("Plan generation returned empty text.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"[{request_id}] Plan generation failed: {str(e)}")
+
+    # ----------------------------
+    # 2) Generate the photorealistic "after" image (Image API)
+    # ----------------------------
+
+    try:
+        # We use the Image API generations endpoint for GPT Image models :contentReference[oaicite:4]{index=4}
+        api_key = _get_openai_api_key()
+
+        # Prompt tuned for photorealistic yard-to-garden transformation
+        image_prompt = f"""
+Photorealistic "after" transformation of the SAME yard shown in the input photo, converted into a thriving edible garden.
+- Preserve the original camera angle and yard boundaries.
+- Replace grass/unused areas with raised beds, mulched paths, and healthy vegetables/herbs.
+- Natural lighting, realistic materials, realistic scale, no text.
+- Looks like a real photo, not a drawing.
+{location_line}
+""".strip()
+
+        # Call OpenAI Images API directly for maximum compatibility
+        # Docs: /v1/images/generations, GPT image models return base64 encoded images :contentReference[oaicite:5]{index=5}
+        r = requests.post(
+            f"{OPENAI_API_BASE}/images/generations",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": DEFAULT_IMAGE_MODEL,
+                "prompt": image_prompt,
+                "n": 1,
+                "size": "1536x1024",   # landscape, good for yard photos
+                "output_format": "png"  # force png output
+            },
+            timeout=120,
+        )
+
+        if r.status_code != 200:
+            raise RuntimeError(f"Images API error {r.status_code}: {r.text}")
+
+        data = r.json()
+        # GPT image models: expect base64 in data[0].b64_json (or similar)
+        img_b64 = None
+        if isinstance(data, dict):
+            arr = data.get("data") or []
+            if arr and isinstance(arr, list) and isinstance(arr[0], dict):
+                img_b64 = arr[0].get("b64_json") or arr[0].get("image_b64") or arr[0].get("base64")
+
+        if not img_b64:
+            raise RuntimeError("Image generation returned no base64 payload.")
+
+        image_b64_png = _ensure_base64_clean(img_b64)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"[{request_id}] Image generation failed: {str(e)}")
+
+    return Yard2GardenResponse(
+        image_b64_png=image_b64_png,
+        plan_markdown=plan_markdown,
+        request_id=request_id,
     )
