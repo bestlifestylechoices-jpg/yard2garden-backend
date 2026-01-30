@@ -242,21 +242,21 @@ Design notes:
 
             # OpenAI image edit
             img = client.images.edit(
-                model=IMAGE_MODEL,
-                image=[open(tmp.name, "rb")],
-                prompt=after_prompt,
-                size=OUTPUT_IMAGE_SIZE,
-                output_format="png",
-            )
+    model=IMAGE_MODEL,
+    image=[open(tmp.name, "rb")],
+    prompt=after_prompt,
+    size=OUTPUT_IMAGE_SIZE,
+)
 
-            # Most OpenAI image responses include base64 in b64_json
-            image_b64_png = img.data[0].b64_json
+image_b64_png = None
+image_url = None
 
-            # Validate base64
-            _ = base64.b64decode(image_b64_png)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Image transformation failed: {str(e)}")
+if hasattr(img.data[0], "b64_json") and img.data[0].b64_json:
+    image_b64_png = img.data[0].b64_json
+elif hasattr(img.data[0], "url") and img.data[0].url:
+    image_url = img.data[0].url
+else:
+    raise Exception("Image generated but no usable image field returned")
 
     # Return modern + backward-compat keys
     return {
