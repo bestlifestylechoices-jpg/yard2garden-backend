@@ -219,8 +219,9 @@ Output MUST be valid JSON (no markdown, no commentary) matching this schema:
     # 2) Generate photorealistic updated image (PNG base64)
     # ----------------------------
     after_prompt = f"""
-Transform this exact yard photo into a realistic food-producing garden that could actually be built.
-Maintain the same camera angle, perspective, and property boundaries.
+Transform this exact yard photo into a realistic food-producing garden.
+Maintain the same camera angle and property boundaries.
+Photorealistic, natural lighting, no text, no labels, no watermark.
 
 Constraints:
 - Budget tier: {budget} (aim around ${budget_info["target_usd"]}; avoid luxury hardscape features)
