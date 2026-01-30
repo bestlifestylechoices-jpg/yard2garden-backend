@@ -184,6 +184,20 @@ Output MUST be valid JSON (no markdown, no commentary) matching this schema:
 """.strip()
 
     try:
+        response = {
+    "plan": plan_text,
+    "garden_plan": garden_plan,
+}
+
+if image_b64_png:
+    response["image_b64_png"] = image_b64_png
+    response["after_image"] = {"mime": "image/png", "base64": image_b64_png}
+
+if image_url:
+    response["image_url"] = image_url
+
+return response
+
         plan_resp = client.responses.create(
             model=PLAN_MODEL,
             input=[
